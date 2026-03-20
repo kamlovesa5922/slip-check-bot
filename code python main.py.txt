@@ -1,0 +1,169 @@
+import telebot
+import os
+import re
+import json
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+from PIL import Image
+import pytesseract
+
+# --- การตั้งค่าดวงตา (OCR) ---
+# สำหรับ PythonAnywhere ใช้ Path นี้ครับ
+pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+# สำหรับ Windows (ถ้าเอากลับมารันในคอม) ให้ใช้: r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+TOKEN = '8561395169:AAFek1_9ECos83z4zVF8K4OytKg9QpP-YSM'
+FILE_NAME = "balance.txt"
+QUEUE_FILE = "queue.txt"
+LOG_FILE = "last_action.json"
+
+bot = telebot.TeleBot(TOKEN)
+
+# --- ฟังก์ชันจัดการระบบไฟล์ ---
+def get_balance():
+    if not os.path.exists(FILE_NAME):
+        with open(FILE_NAME, "w") as f: f.write("10000")
+    with open(FILE_NAME, "r") as f:
+        try:
+            content = f.read().strip().replace(',', '')
+            return float(content) if content else 0.0
+        except: return 0.0
+
+def save_balance(new_val):
+    with open(FILE_NAME, "w") as f: f.write(str(new_val))
+
+def get_queue():
+    if not os.path.exists(QUEUE_FILE): return []
+    with open(QUEUE_FILE, "r") as f:
+        return [line.strip() for line in f.readlines() if line.strip()]
+
+def save_queue(queue_list):
+    with open(QUEUE_FILE, "w") as f:
+        for item in queue_list: f.write(item + "\n")
+
+def save_log(old_balance, old_queue):
+    data = {"balance": old_balance, "queue": old_queue}
+    with open(LOG_FILE, "w") as f: json.dump(data, f)
+
+def undo_action():
+    if not os.path.exists(LOG_FILE): return False
+    with open(LOG_FILE, "r") as f: data = json.load(f)
+    save_balance(data["balance"])
+    save_queue(data["queue"])
+    os.remove(LOG_FILE)
+    return True
+
+# --- ฟังก์ชันอ่านยอดจากสลิป (รองรับหลักหมื่น/แสน) ---
+def extract_amount_from_slip(image_path):
+    try:
+        img = Image.open(image_path)
+        w, h = img.size
+        # เจาะจงตำแหน่งยอดเงินสลิปกรุงเทพ (0.28 - 0.42 ของความสูงรูป)
+        crop_box = (w * 0.1, h * 0.23, w * 0.9, h * 0.45)
+        cropped = img.crop(crop_box).convert('L') # ปรับเป็นขาวดำ
+
+        # อ่านตัวเลขโดยอนุญาตให้มีคอมม่า (,) เพื่อรองรับยอดหลักพันขึ้นไป
+        text = pytesseract.image_to_string(cropped, config='--psm 6 -c tessedit_char_whitelist=0123456789.,')
+
+        # ลบคอมม่าออกทั้งหมดก่อนคำนวณ
+        clean_text = text.replace(',', '')
+
+        # ค้นหาตัวเลขที่มีทศนิยม .00 (กี่หลักก็ได้)
+        match = re.search(r'(\d+\.\d{2})', clean_text)
+        return float(match.group(1)) if match else None
+    except:
+        return None
+
+# --- เมนูปุ่มกด ---
+def main_reply_keyboard():
+    markup = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    markup.add(KeyboardButton("📊 เช็คสถานะระบบ"), KeyboardButton("🔙 ย้อนกลับ (Undo)"))
+    markup.add(KeyboardButton("⏭️ ข้ามคิว"), KeyboardButton("👤 ล้างคิวยูส"))
+    markup.add(KeyboardButton("⚠️ รีเซ็ตทั้งหมด"))
+    return markup
+
+@bot.message_handler(commands=['start', 'menu'])
+def send_menu(message):
+    bot.send_message(message.chat.id, "ระบบจัดการคิวและสลิปพร้อมใช้งาน! ✅", reply_markup=main_reply_keyboard())
+
+# --- จัดการปุ่มกด ---
+@bot.message_handler(func=lambda message: message.text in ["📊 เช็คสถานะระบบ", "🔙 ย้อนกลับ (Undo)", "⏭️ ข้ามคิว", "👤 ล้างคิวยูส", "⚠️ รีเซ็ตทั้งหมด"])
+def handle_buttons(message):
+    current_balance = get_balance()
+    current_queue = get_queue()
+    if message.text == "📊 เช็คสถานะระบบ":
+        q_list = "\n".join([f"{i+1}. {u}" for i, u in enumerate(current_queue)]) if current_queue else "ไม่มีคิวค้าง"
+        bot.reply_to(message, f"💰 **ยอดคงเหลือ:** {current_balance:,.2f}\n👥 **คิวปัจจุบัน:**\n{q_list}", parse_mode="Markdown")
+    elif message.text == "🔙 ย้อนกลับ (Undo)":
+        if undo_action(): bot.reply_to(message, "✅ ย้อนกลับรายการล่าสุดสำเร็จ")
+        else: bot.reply_to(message, "❌ ไม่มีรายการให้ย้อน")
+    elif message.text == "⏭️ ข้ามคิว":
+        if not current_queue: bot.reply_to(message, "❌ ไม่มีคิวให้ข้าม"); return
+        save_log(current_balance, current_queue)
+        skipped = current_queue.pop(0)
+        save_queue(current_queue)
+        bot.reply_to(message, f"⏭️ ข้ามคิว: {skipped}\n👤 คิวถัดไป: {current_queue[0] if current_queue else 'หมดคิว'}")
+    elif message.text == "👤 ล้างคิวยูส":
+        save_log(current_balance, current_queue); save_queue([])
+        bot.reply_to(message, "👤 ล้างคิวยูสเซอร์เรียบร้อยแล้ว")
+    elif message.text == "⚠️ รีเซ็ตทั้งหมด":
+        save_log(current_balance, current_queue); save_balance(0); save_queue([])
+        bot.reply_to(message, "⚠️ รีเซ็ตค่าเงินและล้างคิวทั้งหมดแล้ว")
+
+# --- ระบบรับสลิปและข้อความ ---
+@bot.message_handler(content_types=['text', 'photo'])
+def handle_message(message):
+    if message.text in ["📊 เช็คสถานะระบบ", "🔙 ย้อนกลับ (Undo)", "⏭️ ข้ามคิว", "👤 ล้างคิวยูส", "⚠️ รีเซ็ตทั้งหมด"]: return
+
+    old_balance = get_balance()
+    old_queue = get_queue()
+
+    # 1. กรณีส่งรูป (อ่านสลิปอัตโนมัติ)
+    if message.content_type == 'photo':
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open("temp.jpg", "wb") as f: f.write(downloaded_file)
+
+        amount = extract_amount_from_slip("temp.jpg")
+
+        if amount:
+            save_log(old_balance, old_queue)
+            pop_user = old_queue.pop(0) if old_queue else "ทั่วไป"
+            save_queue(old_queue)
+            new_balance = old_balance - amount
+            save_balance(new_balance)
+
+            calc_summary = f"{pop_user} {old_balance:,.0f}-{amount:,.0f}={new_balance:,.0f}"
+            bot.reply_to(message, f"💸 ตัดยอดอัตโนมัติ: {amount:,.2f}\n`{calc_summary}`\n✅ ยอดคงเหลือ: {new_balance:,.2f}", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "❌ อ่านยอดไม่สำเร็จ (กรุณาส่งรูปใหม่หรือพิมพ์ -ยอด)")
+
+        if os.path.exists("temp.jpg"): os.remove("temp.jpg")
+        return
+
+    # 2. กรณีพิมพ์ยูส หรือ ยอดเงินเอง
+    text = message.text
+    user_match = re.search(r'([a-zA-Z0-9]*ur[a-zA-Z0-9]*)', text, re.IGNORECASE)
+    money_match = re.search(r'([+-])\s*(\d+(\.\d+)?)', text)
+
+    if user_match and not money_match:
+        user_id = user_match.group(1)
+        if user_id in old_queue: bot.reply_to(message, f"⚠️ ยูส {user_id} อยู่ในคิวแล้ว[ลบด้วย]")
+        else: old_queue.append(user_id); save_queue(old_queue)
+        return
+
+    if money_match:
+        save_log(old_balance, old_queue)
+        symbol, amount = money_match.group(1), float(money_match.group(2))
+
+        # คำนวณยอดใหม่
+        new_balance = old_balance + amount if symbol == '+' else old_balance - amount
+        save_balance(new_balance)
+
+        # --- เพิ่มส่วนสรุปยอดช่องกลางตรงนี้ครับ ---
+        action_name = "💰 เติมเงิน" if symbol == "+" else "💸 ถอนเงิน"
+        calc_summary = f"{old_balance:,.0f}{symbol}{amount:,.0f}={new_balance:,.0f}"
+
+        bot.reply_to(message, f"{action_name}: {amount:,.2f}\n`{calc_summary}`\n✅ ยอดคงเหลือ: {new_balance:,.2f}", parse_mode="Markdown")
+
+print("--- บอทระบบสมบูรณ์ (รองรับยอดหลักหมื่น) พร้อมลุย! ---")
+bot.infinity_polling()
